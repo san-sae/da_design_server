@@ -1,5 +1,6 @@
 from pymongo import MongoClient
-from da_design_server2.src import mylogger, myconfig
+from sklearn.linear_model import LinearRegression as lr
+from da_design_server.src import mylogger, myconfig
 import datetime
 import os
 import pdb
@@ -13,17 +14,95 @@ class mydb:
         self._db_ip = cfg['db']['ip']
         self._db_port = int(cfg['db']['port'])
         self._db_name = cfg['db']['name']
-        
         self._db_client = MongoClient(self._db_ip, self._db_port)
         # pymongo.database.Database
         self._db = self._db_client[self._db_name]
         self._cfg = cfg
+
     def get_col_company(self):
         """Get compnay collection.
         :return: company collection.
         :rtype: pymongo.collection.Collection
         """
         return self._db[self._cfg['db']['col_company']]
+
+    def get_col_predicted_company_stock(self):
+        """Get collection of predicted company stock.
+        :return: predicted company stock collection.
+        :rtype: pymongo.collection.Collection
+        """
+        return self._db[self._cfg['db']['col_predicted_company_stock']]
+    
+    def get_predicted_company_stock(self, company_name, logger, D=3, W=3):
+        """Predict future(tomorrow) stock value based on the previous data
+        :param company_name: company name
+        :type company_name: str
+        :param logger: logger instance
+        :type logger: logging.Logger
+        :param D: # of stock values to use for training model
+        :type D: int
+        :param W: feature dimension (window size)
+        :type W: int
+        :return: predicted stock value
+        :rtype: float
+        """
+        col_company = self.get_col_company()
+        doc_company = col_company.find_one({'name': company_name})
+        if not doc_company:
+            logger.info('{} 기업은 존재하지 않음'.format(company_name))
+            return 0.0
+        col_pred_company_stock = self.get_col_predicted_company_stock()
+        doc_pred_company_stock = col_pred_company_stock.find_one({'Company': doc_company['_id']})
+        # 해당기업에대한예측한사례가없었으면, 일단빈껍데기만듬
+        if not doc_pred_company_stock:
+            col_pred_company_stock.insert_one({
+                'Company': doc_company['_id'],
+                'company_stock': []})
+            doc_pred_company_stock = col_pred_company_stock.find_one({'Company': doc_company['_id']})
+        # 내일에해당되는예측값이없으면만들어줌
+        tomorrow = datetime.datetime.today() + datetime.timedelta(days=1)
+        tomorrow = datetime.datetime(tomorrow.year, tomorrow.month, tomorrow.day)
+        doc_new = col_pred_company_stock.find_one({
+            'Company': doc_company['_id'], 'company_stock.date': tomorrow})
+        predicted_value = None
+        if not doc_new:
+            data = [x['value'] for x in doc_company['company_stock']]
+            if len(data) < W + 1:
+                logger.info('{} 기업의 데이터가 {}개보다 적어서 최근 값으로예측'.format(company_name, W))
+                predicted_value = data[-1]
+            else:
+                if len(data) <= D:
+                    target_data = data[:]
+                else:
+                    target_data = data[len(data)-D:]
+                # 모델학습
+                m = lr()
+                X = []
+                y = []
+                for i in range(len(target_data) - W):
+                    X += [target_data[i:i+W]]
+                    y += [target_data[i+W]]
+                m.fit(X, y)
+                logger.info('{}개의 데이터로 모델 학습 완료.'.format(len(X)))
+                # 내일값 예측
+                X = [target_data[len(target_data)-W:]]
+                predicted_value = m.predict(X)[0]
+            col_pred_company_stock.update_one(
+                {'Company': doc_company['_id']},
+                {'$push': {
+                    'company_stock': {
+                    'date': tomorrow,
+                    'value': float(predicted_value)
+                    }
+                }})
+        else:
+            logger.info('기 존재하는 예측치 사용.')
+            for dvs in doc_new['company_stock']:
+                if dvs['date'] == tomorrow:
+                    predicted_value = dvs['value']
+                    break
+        return predicted_value
+    
     def get_company_value_of_date(self, the_date, topk=10):
         """Get company-value(of the day) pairs.
         :param the_date: the date we want to get pairs.
@@ -50,10 +129,8 @@ if __name__ == '__main__':
     cfg = myconfig.get_config('{}/share/project.config'.format(project_root_path))
     log_path = cfg['logger'].get('log_directory')
     logger = mylogger.get_logger(log_path)
-    
     db = mydb(cfg)
     col_company = db.get_col_company()
-    
     logger.info('What\'s in DB company collection..')
     for i, d in enumerate(col_company.find({})):
         if i == 10:
@@ -62,5 +139,7 @@ if __name__ == '__main__':
             d['name'], d['company_stock']))
     d = datetime.datetime.today()
     result = db.get_company_value_of_date(d)
+    print(result)
+    result = db.get_predicted_company_stock('삼성전자', logger)
     print(result)
 
